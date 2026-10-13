@@ -5,6 +5,8 @@ mod blit;
 mod camera;
 mod character;
 mod input;
+#[allow(dead_code)]
+mod luau;
 mod physics;
 mod rig;
 

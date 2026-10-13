@@ -13,6 +13,7 @@ anyhow = "1.0.104"
 kahua-io = { git = "https://github.com/Username59138/kahua" }
 kahua-render = { git = "https://github.com/Username59138/kahua" }
 pollster = { version = "1.0.1", default-features = false }
+mlua = { version = "0.12.2", features = ["luau"] }
 rapier3d = "0.36.1"
 winit = "0.30.13"
 
