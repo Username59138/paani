@@ -433,3 +433,30 @@ fn position_and_orientation_round_trip() {
     assert!(errors(&output).is_empty(), "{output:?}");
     assert_eq!(texts(&output), ["pose ok"]);
 }
+
+#[test]
+fn wait_inside_coroutines_sleeps_the_coroutine() {
+    // A common Roblox pattern: a loop with wait() inside coroutine.wrap keeps
+    // running in the background while the script continues.
+    let source = r#"
+        local ticks = 0
+        coroutine.wrap(function()
+            while true do
+                wait(0.25)
+                ticks += 1
+            end
+        end)()
+        local co = coroutine.create(function()
+            wait(0.5)
+            print("resumed")
+        end)
+        assert(coroutine.resume(co) == true)
+        wait(1.1)
+        print("ticks " .. ticks)
+    "#;
+    let (mut host, _shared) = host_with_script(source);
+    run_for(&mut host, 1.2);
+    let output = host.take_output();
+    assert!(errors(&output).is_empty(), "{:?}", errors(&output));
+    assert_eq!(texts(&output), ["resumed", "ticks 4"]);
+}

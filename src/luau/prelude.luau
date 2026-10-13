@@ -10,6 +10,31 @@ function wait(seconds)
 	return coroutine.yield(MARK, seconds)
 end
 
+-- A script's own coroutine that calls wait() yields MARK to whoever resumed
+-- it. Hand it to the scheduler instead, so it wakes up later on its own like
+-- in Roblox, and the caller sees an ordinary yield.
+local rawResume = coroutine.resume
+
+coroutine.resume = function(co, ...)
+	local results = table.pack(rawResume(co, ...))
+	if results[1] and results[2] == MARK and coroutine.status(co) == "suspended" then
+		native.sleep(co, results[3])
+		return true
+	end
+	return table.unpack(results, 1, results.n)
+end
+
+coroutine.wrap = function(f)
+	local co = coroutine.create(f)
+	return function(...)
+		local results = table.pack(coroutine.resume(co, ...))
+		if not results[1] then
+			error(results[2], 2)
+		end
+		return table.unpack(results, 2, results.n)
+	end
+end
+
 task = {
 	wait = function(seconds)
 		local elapsed = coroutine.yield(MARK, seconds)

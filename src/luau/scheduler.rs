@@ -176,6 +176,16 @@ pub(crate) fn install_natives(lua: &Lua, natives: &Table) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
+    natives.set(
+        "sleep",
+        lua.create_function(|lua, (thread, seconds): (Thread, Option<f64>)| {
+            let ctx = context(lua);
+            let mut scheduler = ctx.scheduler.borrow_mut();
+            let wake_at = scheduler.now + seconds.unwrap_or(0.0).max(MIN_WAIT);
+            scheduler.push(thread, wake_at, None);
+            Ok(())
+        })?,
+    )?;
     natives.set("clock", lua.create_function(|lua, ()| Ok(context(lua).scheduler.borrow().now))?)?;
     natives.set(
         "unixClock",
