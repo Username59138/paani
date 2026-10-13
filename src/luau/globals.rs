@@ -49,10 +49,12 @@ fn log(lua: &Lua, kind: OutputKind, args: MultiValue) -> mlua::Result<()> {
 /// report their Luau type.
 fn type_name(value: &Value) -> String {
     let name = match value {
-        Value::UserData(ud) => userdata_type(ud),
+        Value::UserData(ud) => userdata_type(ud).map(str::to_string),
+        // Signals and connections are Luau tables tagged with __type (prelude.luau).
+        Value::Table(t) => t.metatable().and_then(|m| m.get::<Option<String>>("__type").ok().flatten()),
         _ => None,
     };
-    name.map_or_else(|| value.type_name().to_string(), str::to_string)
+    name.unwrap_or_else(|| value.type_name().to_string())
 }
 
 fn userdata_type(ud: &AnyUserData) -> Option<&'static str> {

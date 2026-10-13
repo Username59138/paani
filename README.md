@@ -12,7 +12,7 @@ git clone https://github.com/Username59138/paani
 cd paani
 cargo run --release -- examples/demo.rbxl
 cargo run --release -- examples/physics.rbxl   # things that fall
-cargo run --release -- examples/scripts.rbxl   # Luau scripts changing the world
+cargo run --release -- examples/scripts.rbxl   # Luau scripts: kill brick, coin, raining balls
 ```
 
 ## Controls
@@ -29,7 +29,7 @@ cargo run --release -- examples/scripts.rbxl   # Luau scripts changing the world
 
 ## Roadmap
 
-1. **Engine** (offline): render places ✅, physics ✅, character ✅, Luau scripts (core ✅, events next)
+1. **Engine** (offline): render places ✅, physics ✅, character ✅, Luau scripts ✅ (events, Touched, death and respawn)
 2. **Client**: home screen, settings, graphics presets, profiles, stats
 3. **Online**: join Roblox servers, server browser
 

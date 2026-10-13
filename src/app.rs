@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use kahua_io::rbx_dom_weak::types::{Ref, Variant};
 use kahua_render::{COLOR_FORMAT, Camera, Overlay, Renderer, Scene, wgpu};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -124,6 +125,10 @@ pub struct App {
     scene: Scene,
     physics: Physics,
     character: Character,
+    /// Game time when the character died; it respawns after Players.RespawnTime.
+    dead_since: Option<f32>,
+    /// Seconds since the place was loaded.
+    time: f32,
     orbit: Orbit,
     /// Set while the free camera (F) is on; the character then stands still.
     free_camera: Option<Camera>,
@@ -165,6 +170,8 @@ impl App {
             scene,
             physics,
             character,
+            dead_since: None,
+            time: 0.0,
             orbit,
             free_camera: None,
             input: Input::default(),
@@ -201,13 +208,102 @@ impl App {
         self.console.extend(self.scripts.take_output());
         let excess = self.console.len().saturating_sub(CONSOLE_LINES);
         self.console.drain(..excess);
-        if !self.scripts.take_dirty() {
-            return;
+        if self.scripts.take_dirty() {
+            self.rebuild();
         }
+    }
+
+    fn alive(&self) -> bool {
+        self.dead_since.is_none()
+    }
+
+    /// Rebuilds the scene and physics from the DOM. A living character moves
+    /// on its own; a dead one's parts are ordinary loose parts.
+    fn rebuild(&mut self) {
         let dom = self.dom.borrow();
         self.scene = Scene::extract(&dom);
-        self.physics = Physics::new(&dom, &self.scene, Some(self.character.model), Some(&self.physics));
-        self.character.reattach(&dom, &self.scene, &mut self.physics);
+        let skip = self.alive().then_some(self.character.model);
+        self.physics = Physics::new(&dom, &self.scene, skip, Some(&self.physics));
+        if self.alive() {
+            self.character.reattach(&dom, &self.scene, &mut self.physics);
+        }
+    }
+
+    /// Fires Touched and TouchEnded on both parts of every pair that started or stopped touching.
+    fn fire_touches(&mut self) {
+        let (started, ended) = self.physics.touches();
+        for (pairs, event) in [(started, "Touched"), (ended, "TouchEnded")] {
+            for (a, b) in pairs {
+                self.scripts.fire(a, event, &[b]);
+                self.scripts.fire(b, event, &[a]);
+            }
+        }
+    }
+
+    /// Like Roblox: a Humanoid at 0 health, or one that fell out of the world,
+    /// dies. Its joints break so the body falls apart.
+    fn check_death(&mut self) {
+        if !self.alive() {
+            return;
+        }
+        let humanoid = self.character.humanoid;
+        let (health, fell) = {
+            let dom = self.dom.borrow();
+            (rig::float(&dom, Some(humanoid), "Health", 100.0), self.character.fell(&dom))
+        };
+        if health > 0.0 && !fell {
+            return;
+        }
+        {
+            let mut dom = self.dom.borrow_mut();
+            if let Some(h) = dom.get_by_ref_mut(humanoid) {
+                h.properties.insert("Health".into(), Variant::Float32(0.0));
+            }
+            let joints: Vec<Ref> = dom
+                .descendants_of(self.character.model)
+                .filter(|i| matches!(i.class.as_str(), "Motor6D" | "Weld" | "ManualWeld" | "WeldConstraint" | "Snap"))
+                .map(|i| i.referent())
+                .collect();
+            for joint in joints {
+                dom.destroy(joint);
+            }
+        }
+        // A script that set Health to 0 already fired Died.
+        if health > 0.0 {
+            self.scripts.fire(humanoid, "Died", &[]);
+        }
+        self.dead_since = Some(self.time);
+        self.rebuild();
+    }
+
+    /// Replaces a dead character with a new one after Players.RespawnTime.
+    fn check_respawn(&mut self) {
+        let Some(died) = self.dead_since else { return };
+        let respawn_time = {
+            let dom = self.dom.borrow();
+            rig::float(&dom, rig::service(&dom, "Players"), "RespawnTime", 5.0)
+        };
+        if self.time - died < respawn_time {
+            return;
+        }
+        let (model, gone) = {
+            let mut dom = self.dom.borrow_mut();
+            let old = self.character.model;
+            let gone: Vec<Ref> = dom.descendants_of(old).map(|i| i.referent()).collect();
+            dom.destroy(old);
+            (rig::spawn(&mut dom), gone)
+        };
+        self.scripts.forget(&gone);
+        self.dead_since = None;
+        {
+            let dom = self.dom.borrow();
+            self.scene = Scene::extract(&dom);
+            self.physics = Physics::new(&dom, &self.scene, Some(model), Some(&self.physics));
+            self.character = Character::new(&dom, model, &self.scene, &mut self.physics);
+        }
+        self.character.write_back(&mut self.dom.borrow_mut());
+        self.scripts.character_added(model);
+        self.sync_scripts();
     }
 
     /// Returns the error that stopped the event loop, if any.
@@ -252,11 +348,14 @@ impl App {
     /// Advances the game by `dt` seconds: scripts, character, physics. Returns
     /// the camera to draw with.
     fn tick(&mut self, dt: f32) -> Camera {
+        self.time += dt;
         // Scripts see where things are now, then may change them.
         {
             let mut dom = self.dom.borrow_mut();
             self.physics.write_back(&mut dom);
-            self.character.write_back(&mut dom);
+            if self.alive() {
+                self.character.write_back(&mut dom);
+            }
         }
         self.scripts.step(dt as f64);
         self.sync_scripts();
@@ -270,13 +369,20 @@ impl App {
             }
             None => {
                 self.orbit.update(look, scroll);
-                let dom = self.dom.borrow();
-                self.character.update(&dom, &self.input, self.orbit.yaw, dt, &mut self.physics);
+                if self.alive() {
+                    let dom = self.dom.borrow();
+                    self.character.update(&dom, &self.input, self.orbit.yaw, dt, &mut self.physics);
+                }
                 self.orbit.camera(self.character.focus())
             }
         };
         self.physics.update(dt, &mut self.scene);
-        self.character.place(&mut self.scene);
+        if self.alive() {
+            self.character.place(&mut self.scene);
+        }
+        self.fire_touches();
+        self.check_death();
+        self.check_respawn();
         camera
     }
 }
@@ -420,5 +526,102 @@ mod tests {
         let root = dom.descendants().find(|i| i.name == "HumanoidRootPart").unwrap();
         let Some(Variant::CFrame(cf)) = root.properties.get(&"CFrame".into()) else { panic!() };
         assert!((cf.position.x - 50.0).abs() < 0.1);
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use std::f32::consts::FRAC_PI_2;
+
+    use kahua_render::glam::Vec3;
+
+    use super::*;
+
+    fn load() -> App {
+        App::load(Path::new("examples/scripts.rbxl"), String::new()).unwrap()
+    }
+
+    fn run(app: &mut App, seconds: f32) {
+        for _ in 0..(seconds * 60.0) as usize {
+            app.tick(1.0 / 60.0);
+        }
+    }
+
+    fn printed(app: &App, text: &str) -> usize {
+        app.console.iter().filter(|l| l.text == text).count()
+    }
+
+    /// Walks toward `yaw` (0 = -Z) for `seconds`.
+    fn walk(app: &mut App, yaw: f32, seconds: f32) {
+        app.orbit.yaw = yaw;
+        app.input.key(KeyCode::KeyW, true);
+        run(app, seconds);
+        app.input.key(KeyCode::KeyW, false);
+    }
+
+    #[test]
+    fn kill_brick_kills_and_the_character_respawns() {
+        let mut app = load();
+        run(&mut app, 0.5);
+        assert_eq!(printed(&app, "Player1 joined"), 1);
+        assert_eq!(printed(&app, "Character spawned"), 1);
+        let first = app.character.model;
+
+        // Walk +X onto the kill brick.
+        walk(&mut app, -FRAC_PI_2, 1.0);
+        assert!(!app.alive(), "died at {}", app.character.position);
+        assert_eq!(printed(&app, "Player1 died"), 1);
+        {
+            let dom = app.dom.borrow();
+            assert!(dom.descendants_of(first).all(|i| i.class != "Motor6D"), "the body fell apart");
+        }
+
+        // A new character spawns after Players.RespawnTime (5 s).
+        run(&mut app, 4.0);
+        assert!(!app.alive());
+        run(&mut app, 1.5);
+        assert!(app.alive());
+        assert_ne!(app.character.model, first);
+        assert!(app.dom.borrow().get_by_ref(first).is_none(), "the old body is gone");
+        assert_eq!(printed(&app, "Character spawned"), 2);
+        assert!((app.character.position - Vec3::new(0.0, 4.0, 0.0)).length() < 0.1);
+        // The new character's scripts ran again (WalkSpeed 24 from StarterCharacterScripts).
+        let dom = app.dom.borrow();
+        assert_eq!(rig::float(&dom, Some(app.character.humanoid), "WalkSpeed", 0.0), 24.0);
+        assert_eq!(rig::float(&dom, Some(app.character.humanoid), "Health", 0.0), 100.0);
+        drop(dom);
+        let errors: Vec<_> = app.console.iter().filter(|l| l.kind == crate::luau::OutputKind::Error).collect();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn touching_a_coin_collects_it_once() {
+        let mut app = load();
+        run(&mut app, 0.5);
+        walk(&mut app, FRAC_PI_2, 1.0);
+        assert_eq!(printed(&app, "Coin collected!"), 1);
+        assert!(app.dom.borrow().descendants().all(|i| i.name != "Coin"));
+        assert!(app.alive());
+    }
+
+    #[test]
+    fn falling_out_of_the_world_kills() {
+        let mut app = load();
+        run(&mut app, 0.5);
+        let dom = app.dom.borrow();
+        let root = dom.descendants().find(|i| i.name == "HumanoidRootPart").unwrap().referent();
+        drop(dom);
+        // Teleport far off the baseplate and let it fall.
+        app.dom.borrow_mut().get_by_ref_mut(root).unwrap().properties.insert(
+            "CFrame".into(),
+            Variant::CFrame(kahua_render::scene::cframe_from_pos_rot(
+                Vec3::new(5000.0, 0.0, 0.0),
+                kahua_render::glam::Quat::IDENTITY,
+            )),
+        );
+        app.rebuild();
+        run(&mut app, 3.0);
+        assert!(!app.alive());
+        assert_eq!(printed(&app, "Player1 died"), 1);
     }
 }

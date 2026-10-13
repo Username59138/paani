@@ -33,7 +33,7 @@ const FLOOR_SNAP: f32 = 0.6;
 pub struct Character {
     pub model: Ref,
     root: Ref,
-    humanoid: Ref,
+    pub humanoid: Ref,
     /// Every part of the character with its transform relative to the root frame.
     members: Vec<(Ref, Mat4)>,
     /// The visible ones: (index in `Scene::parts`, transform relative to the root frame).
@@ -43,11 +43,11 @@ pub struct Character {
     capsule_offset: Vec3,
     half_height: f32,
     radius: f32,
+    /// What the character touches with: (reported part, half size, offset from the capsule center).
+    touch: (Ref, Vec3, Vec3),
     /// From the root down to the feet (negative).
     feet: f32,
     step: f32,
-    /// Root position when standing on the spawn point.
-    spawn: Vec3,
     pub position: Vec3,
     /// Radians; 0 faces -Z, like `Camera::yaw`.
     pub yaw: f32,
@@ -86,9 +86,14 @@ impl Character {
         let radius = (root_width * 0.5).clamp(0.2, height * 0.5);
         let half_height = (height * 0.5 - radius).max(0.01);
         let capsule_offset = Vec3::new(0.0, (bottom + max.y) * 0.5, 0.0);
+        // Touches are reported as the lowest part (a leg), so `hit.Parent` is the
+        // character. The box reaches a little below the feet to touch the floor.
+        let lowest = members.iter().min_by(|a, b| a.1.w_axis.y.total_cmp(&b.1.w_axis.y)).map_or(root, |m| m.0);
+        let (low, high) = (min - Vec3::new(0.0, 0.1, 0.0), max);
+        let touch = (lowest, (high - low) * 0.5, (high + low) * 0.5 - capsule_offset);
 
         let spawn = spawn_point(dom, physics) - Vec3::new(0.0, min.y, 0.0);
-        let capsule = physics.add_capsule(spawn + capsule_offset, half_height, radius);
+        let capsule = physics.add_capsule(spawn + capsule_offset, half_height, radius, touch);
         Self {
             model,
             root,
@@ -99,9 +104,9 @@ impl Character {
             capsule_offset,
             half_height,
             radius,
+            touch,
             feet: min.y,
             step,
-            spawn,
             position: spawn,
             yaw,
             vertical_speed: 0.0,
@@ -120,7 +125,8 @@ impl Character {
             self.vertical_speed = 0.0;
         }
         self.parts = visible(&self.members, scene);
-        self.capsule = physics.add_capsule(self.position + self.capsule_offset, self.half_height, self.radius);
+        self.capsule =
+            physics.add_capsule(self.position + self.capsule_offset, self.half_height, self.radius, self.touch);
     }
 
     /// Writes the character's parts' CFrames, so scripts see where it is.
@@ -199,16 +205,11 @@ impl Character {
             }
         }
         physics.place_capsule(&self.capsule, self.position + self.capsule_offset);
-
-        if self.position.y < float(dom, Some(world_root(dom)), "FallenPartsDestroyHeight", FALLEN_HEIGHT) {
-            self.respawn(physics);
-        }
     }
 
-    pub fn respawn(&mut self, physics: &mut Physics) {
-        self.position = self.spawn;
-        self.vertical_speed = 0.0;
-        physics.teleport_capsule(&self.capsule, self.position + self.capsule_offset);
+    /// Whether the character fell below Workspace.FallenPartsDestroyHeight, which kills it.
+    pub fn fell(&self, dom: &WeakDom) -> bool {
+        self.position.y < float(dom, Some(world_root(dom)), "FallenPartsDestroyHeight", FALLEN_HEIGHT)
     }
 
     /// Moves the character's parts in the scene to where the character is.

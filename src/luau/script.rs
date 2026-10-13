@@ -85,17 +85,33 @@ fn local_scripts(dom: &mut WeakDom) -> Vec<Ref> {
         }
     }
     let character = dom.get_by_ref(player).and_then(|p| prop_ref(p, "Character"));
-    let Some(character) = character.filter(|&c| dom.get_by_ref(c).is_some()) else {
-        return to_run;
-    };
+    if let Some(character) = character.filter(|&c| dom.get_by_ref(c).is_some()) {
+        to_run.extend(character_scripts(dom, character));
+    }
+    to_run.retain(|&r| is_enabled(dom, r));
+    to_run
+}
+
+/// Clones StarterCharacterScripts into `character` and returns the
+/// LocalScripts in it that should run.
+fn character_scripts(dom: &mut WeakDom, character: Ref) -> Vec<Ref> {
+    let starter = rig::service(dom, "StarterPlayer");
     if let Some(source) = starter.and_then(|sp| rig::child_of_class(dom, sp, "StarterCharacterScripts")) {
         clone_children(dom, source, character);
     }
-    let mut in_character = Vec::new();
-    collect_scripts(dom, character, "LocalScript", &mut in_character);
-    to_run.extend(in_character);
-    to_run.retain(|&r| is_enabled(dom, r));
-    to_run
+    let mut scripts = Vec::new();
+    collect_scripts(dom, character, "LocalScript", &mut scripts);
+    scripts.retain(|&r| is_enabled(dom, r));
+    scripts
+}
+
+/// Runs the scripts of a respawned character.
+pub(crate) fn character_added(lua: &Lua, character: Ref) {
+    let ctx = context(lua);
+    let scripts = character_scripts(&mut ctx.dom.borrow_mut(), character);
+    for script in scripts {
+        run_script(lua, &ctx, script);
+    }
 }
 
 fn is_script_class(dom: &WeakDom, r: Ref, class: &str) -> bool {

@@ -12,6 +12,7 @@ use mlua::{FromLua, Lua, MetaMethod, Table, UserData, UserDataMethods, Value};
 use super::cframe::{LuaCFrame, orientation_degrees, with_orientation};
 use super::color3::{LuaBrickColor, LuaColor3};
 use super::convert::{to_lua, to_variant};
+use super::events::{self, Change};
 use super::script::full_name;
 use super::vector3::{LuaVector3, as_vector};
 use super::{Context, context};
@@ -167,8 +168,12 @@ fn get(lua: &Lua, r: Ref, key: &str) -> mlua::Result<Value> {
     }
     let member = {
         let dom = ctx.dom.borrow();
-        if dom.get_by_ref(r).is_none() {
+        let Some(inst) = dom.get_by_ref(r) else {
             return Err(destroyed());
+        };
+        if events::is_event(&inst.class, key) {
+            drop(dom);
+            return events::signal(lua, r, key);
         }
         lookup(&dom, r, key)
     };
@@ -190,11 +195,19 @@ fn get(lua: &Lua, r: Ref, key: &str) -> mlua::Result<Value> {
 
 fn set(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
     let ctx = context(lua);
-    let mut dom = ctx.dom.borrow_mut();
+    let change = write(&mut ctx.dom.borrow_mut(), r, key, value)?;
+    ctx.dirty.set(true);
+    events::changed(lua, r, key, change);
+    Ok(())
+}
+
+/// Writes a property, returning what changed so events fire once the DOM is unborrowed.
+fn write(dom: &mut WeakDom, r: Ref, key: &str, value: Value) -> mlua::Result<Change> {
     let Some(inst) = dom.get_by_ref(r) else {
         return Err(destroyed());
     };
     let class = inst.class.to_string();
+    let mut change = Change::Property;
     match key {
         "Name" => {
             let name = match &value {
@@ -203,12 +216,15 @@ fn set(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
             };
             dom.get_by_ref_mut(r).expect("checked above").name = name;
         }
-        "Parent" => set_parent(&mut dom, r, &value)?,
+        "Parent" => {
+            change = Change::Parent { old: parent_of(dom, r) };
+            set_parent(dom, r, &value)?;
+        }
         "ClassName" => {
             return Err(mlua::Error::runtime("Unable to assign property ClassName. Property is read only"));
         }
         "Position" | "Orientation" if reflect::is_base_part(&class) => {
-            let mut cframe = stored_cframe(&dom, r).unwrap_or(Mat4::IDENTITY);
+            let mut cframe = stored_cframe(dom, r).unwrap_or(Mat4::IDENTITY);
             let vector = as_vector(&value)
                 .ok_or_else(|| mlua::Error::runtime(format!("Unable to assign property {key}. Vector3 expected")))?;
             cframe = if key == "Position" {
@@ -218,25 +234,51 @@ fn set(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
             } else {
                 with_orientation(&cframe, vector)
             };
-            store(&mut dom, r, "CFrame", Variant::CFrame(mat4_to_cframe(&cframe)));
+            store(dom, r, "CFrame", Variant::CFrame(mat4_to_cframe(&cframe)));
         }
         _ => {
             let Some(descriptor) = reflect::property(&class, key) else {
-                return Err(not_a_member(&class, &full_name(&dom, r), key));
+                return Err(not_a_member(&class, &full_name(dom, r), key));
             };
             let variant = to_variant(&value, &descriptor.data_type, key)?;
+            if class == "Humanoid" && key == "Health" {
+                change = Change::Health { old: crate::rig::float(dom, Some(r), "Health", 100.0) };
+            }
             if let Variant::BrickColor(brick) = &variant
                 && key == "BrickColor"
             {
                 let c = brick.to_color3uint8();
                 let color = Color3::new(f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0);
-                store(&mut dom, r, "Color", Variant::Color3(color));
+                store(dom, r, "Color", Variant::Color3(color));
             }
-            store(&mut dom, r, key, variant);
+            store(dom, r, key, variant);
         }
     }
+    Ok(change)
+}
+
+/// Destroys `r` and its descendants: Destroying fires first, then the parent's
+/// ChildRemoved, and their signals are disconnected.
+fn destroy(lua: &Lua, r: Ref) {
+    let ctx = context(lua);
+    events::fire(lua, r, "Destroying", ());
+    let (parent, gone) = {
+        let mut dom = ctx.dom.borrow_mut();
+        if dom.get_by_ref(r).is_none() {
+            return;
+        }
+        let parent = parent_of(&dom, r);
+        let mut gone = vec![r];
+        descendants(&dom, r, &mut gone);
+        dom.destroy(r);
+        (parent, gone)
+    };
+    forget_modules(&ctx, &gone);
     ctx.dirty.set(true);
-    Ok(())
+    if let Some(parent) = parent {
+        events::fire(lua, parent, "ChildRemoved", InstanceRef(r));
+    }
+    events::forget(lua, &gone);
 }
 
 fn store(dom: &mut WeakDom, r: Ref, key: &str, value: Variant) {
@@ -378,31 +420,20 @@ impl UserData for InstanceRef {
         });
         methods.add_method("Destroy", |lua, this, ()| {
             let ctx = context(lua);
-            let mut dom = ctx.dom.borrow_mut();
-            if this.0 == dom.root_ref() {
+            if this.0 == ctx.dom.borrow().root_ref() {
                 return Err(mlua::Error::runtime("Cannot destroy the DataModel"));
             }
-            if dom.get_by_ref(this.0).is_some() {
-                let mut gone = vec![this.0];
-                descendants(&dom, this.0, &mut gone);
-                dom.destroy(this.0);
-                forget_modules(&ctx, &gone);
-                ctx.dirty.set(true);
+            if ctx.dom.borrow().get_by_ref(this.0).is_some() {
+                destroy(lua, this.0);
             }
             Ok(())
         });
         methods.add_method("ClearAllChildren", |lua, this, ()| {
-            let ctx = context(lua);
-            let mut dom = ctx.dom.borrow_mut();
-            let children = dom.get_by_ref(this.0).map(|i| i.children().to_vec()).unwrap_or_default();
-            let mut gone = Vec::new();
+            let children =
+                dom_ref(lua, |dom| dom.get_by_ref(this.0).map(|i| i.children().to_vec()).unwrap_or_default());
             for child in children {
-                gone.push(child);
-                descendants(&dom, child, &mut gone);
-                dom.destroy(child);
+                destroy(lua, child);
             }
-            forget_modules(&ctx, &gone);
-            ctx.dirty.set(true);
             Ok(())
         });
         methods.add_method("Clone", |lua, this, ()| {
@@ -447,14 +478,17 @@ impl UserData for InstanceRef {
             if let Variant::Attributes(attributes) = entry {
                 match variant {
                     Some(v) => {
-                        attributes.insert(name, v);
+                        attributes.insert(name.clone(), v);
                     }
                     None => {
                         attributes.remove(name.as_str());
                     }
                 }
             }
+            drop(dom);
             ctx.dirty.set(true);
+            events::fire(lua, this.0, "AttributeChanged", name.clone());
+            events::fire(lua, this.0, &format!("attr:{name}"), ());
             Ok(())
         });
 
@@ -502,7 +536,11 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
                 builder = base_part_defaults(builder, &class);
             }
             let created = dom.insert(parent_ref, builder);
+            drop(dom);
             ctx.dirty.set(true);
+            if parent_ref.is_some() {
+                events::parented(lua, created, None);
+            }
             Ok(InstanceRef(created))
         })?,
     )?;

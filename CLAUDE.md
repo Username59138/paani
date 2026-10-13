@@ -24,12 +24,17 @@ Open-source Roblox place client in Rust. Companion to Kahua Studio (`../kahua`).
   if scripts changed the DOM, rebuild scene + physics (velocities kept, character re-attached, a
   moved HumanoidRootPart = teleport) → character → physics. Physics::new does a zero-length step
   so raycasts work right away. Rebuilding every frame is fine for small places; optimize later.
+- Events: signals/connections are Luau tables in `prelude.luau`; `luau/events.rs` says which members
+  are events and fires them (only with the DOM unborrowed). Touched comes from `Physics::touches`
+  (touching pairs diffed each frame, carried across rebuilds); the character touches through a
+  sensor box reported as its lowest part. Death (Health 0 or falling) breaks joints, respawn after
+  Players.RespawnTime runs StarterCharacterScripts again and fires CharacterAdded.
 - Test places: `examples/scripts.rbxl` (`scripts_demo` example; `app::tests` run the full loop),
   `examples/demo.rbxl` (Kahua's `demo_place` example), `examples/physics.rbxl`
   (`cargo run --example physics_demo -- examples/physics.rbxl`; `cargo test` simulates it).
 - Usage limits are tight: one feature per session, keep changes small.
 
 ## Plan
-1. Engine (offline): ~~render places~~ → ~~physics~~ → ~~character~~ → ~~Luau core~~ → Luau events (Touched, Heartbeat, Changed) → GUI
+1. Engine (offline): ~~render places~~ → ~~physics~~ → ~~character~~ → ~~Luau core~~ → ~~Luau events~~ → GUI
 2. Client: home screen, settings, graphics presets, profiles, stats (mockups exist)
 3. Online: Roblox servers, server browser. No cheat features.

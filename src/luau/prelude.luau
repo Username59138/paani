@@ -5,6 +5,9 @@ local native = ...
 -- Unique yield tag. A thread that yields (MARK, seconds) is put to sleep by the
 -- scheduler; a yield without it is a script's own coroutine and is not ours.
 local MARK = {}
+-- Yielded by Signal:Wait. The thread stays suspended until the signal fires
+-- and its handler resumes it; the scheduler does nothing with it.
+local SUSPEND = {}
 
 function wait(seconds)
 	return coroutine.yield(MARK, seconds)
@@ -17,9 +20,13 @@ local rawResume = coroutine.resume
 
 coroutine.resume = function(co, ...)
 	local results = table.pack(rawResume(co, ...))
-	if results[1] and results[2] == MARK and coroutine.status(co) == "suspended" then
-		native.sleep(co, results[3])
-		return true
+	if results[1] and coroutine.status(co) == "suspended" then
+		if results[2] == MARK then
+			native.sleep(co, results[3])
+			return true
+		elseif results[2] == SUSPEND then
+			return true
+		end
 	end
 	return table.unpack(results, 1, results.n)
 end
@@ -72,7 +79,104 @@ function require(moduleScript)
 	return results[1]
 end
 
+-- RBXScriptSignal and RBXScriptConnection. Rust decides which members are
+-- events and fires them by key (see events.rs).
+
+local Connection = {}
+Connection.__index = Connection
+Connection.__type = "RBXScriptConnection"
+
+function Connection:Disconnect()
+	if not self.Connected then
+		return
+	end
+	self.Connected = false
+	local handlers = self._signal._handlers
+	local index = table.find(handlers, self)
+	if index then
+		table.remove(handlers, index)
+	end
+end
+
+local Signal = {}
+Signal.__index = Signal
+Signal.__type = "RBXScriptSignal"
+
+function Signal:Connect(handler)
+	if type(handler) ~= "function" then
+		error("Attempt to connect failed: Passed value is not a function", 2)
+	end
+	local connection = setmetatable({ Connected = true, _handler = handler, _signal = self }, Connection)
+	table.insert(self._handlers, connection)
+	return connection
+end
+
+function Signal:Once(handler)
+	local connection
+	connection = self:Connect(function(...)
+		connection:Disconnect()
+		handler(...)
+	end)
+	return connection
+end
+
+function Signal:Wait()
+	local thread = coroutine.running()
+	self:Once(function(...)
+		task.spawn(thread, ...)
+	end)
+	return coroutine.yield(SUSPEND)
+end
+
+local signalsByKey = {}
+
+local signals = {}
+
+function signals.get(key)
+	local signal = signalsByKey[key]
+	if signal == nil then
+		signal = setmetatable({ _handlers = {} }, Signal)
+		signalsByKey[key] = signal
+	end
+	return signal
+end
+
+-- Each handler runs on its own thread, so one that waits or fails doesn't stop the others.
+function signals.fire(key, ...)
+	local signal = signalsByKey[key]
+	if signal == nil then
+		return
+	end
+	for _, connection in table.clone(signal._handlers) do
+		if connection.Connected then
+			task.spawn(connection._handler, ...)
+		end
+	end
+end
+
+-- Drops the signals of a destroyed instance (keys start with its id).
+function signals.forget(prefix)
+	for key in signalsByKey do
+		if string.sub(key, 1, #prefix) == prefix then
+			signalsByKey[key] = nil
+		end
+	end
+end
+
 local instanceMethods = {}
+
+function instanceMethods.GetPropertyChangedSignal(self, property)
+	return signals.get(native.signalKey(self, "prop:" .. property))
+end
+
+function instanceMethods.GetAttributeChangedSignal(self, attribute)
+	return signals.get(native.signalKey(self, "attr:" .. attribute))
+end
+
+-- BindableEvent:Fire. Harmless on other classes, which have no Event signal.
+function instanceMethods.Fire(self, ...)
+	signals.fire(native.signalKey(self, "Event"), ...)
+end
 
 function instanceMethods.WaitForChild(self, name, timeout)
 	local child = self:FindFirstChild(name)
@@ -95,4 +199,5 @@ end
 return {
 	waitMarker = MARK,
 	instanceMethods = instanceMethods,
+	signals = signals,
 }

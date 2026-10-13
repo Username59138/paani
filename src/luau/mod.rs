@@ -7,6 +7,7 @@ mod cframe;
 mod color3;
 mod convert;
 mod enums;
+mod events;
 mod globals;
 mod instance;
 mod scheduler;
@@ -24,7 +25,10 @@ use kahua_io::rbx_dom_weak::WeakDom;
 use kahua_io::rbx_dom_weak::types::Ref;
 use mlua::{Lua, RegistryKey, Table, VmState};
 
+use instance::InstanceRef;
 use scheduler::Scheduler;
+
+use crate::rig;
 
 pub type SharedDom = Rc<RefCell<WeakDom>>;
 
@@ -66,6 +70,8 @@ pub(crate) struct Context {
     pub wait_marker: RefCell<Option<Table>>,
     /// Methods implemented in Luau, such as WaitForChild.
     pub instance_methods: RefCell<Option<Table>>,
+    /// The prelude's signal store: `get`, `fire`, `forget`.
+    pub signals: RefCell<Option<Table>>,
     /// Module results by ModuleScript, kept alive for the host's lifetime.
     pub modules: RefCell<HashMap<Ref, RegistryKey>>,
     /// Unix time at `ScriptHost::new`, so `tick()` reads as a wall clock.
@@ -106,6 +112,7 @@ impl ScriptHost {
             scheduler: RefCell::new(Scheduler::default()),
             wait_marker: RefCell::new(None),
             instance_methods: RefCell::new(None),
+            signals: RefCell::new(None),
             modules: RefCell::new(HashMap::new()),
             start_unix,
         });
@@ -129,10 +136,12 @@ impl ScriptHost {
         let natives = lua.create_table()?;
         scheduler::install_natives(lua, &natives)?;
         script::install_natives(lua, &natives)?;
+        events::install_natives(lua, &natives)?;
         globals::install(lua)?;
         let exports: Table = lua.load(include_str!("prelude.luau")).set_name("=Paani.prelude").call(natives)?;
         *self.ctx.wait_marker.borrow_mut() = Some(exports.get("waitMarker")?);
         *self.ctx.instance_methods.borrow_mut() = Some(exports.get("instanceMethods")?);
+        *self.ctx.signals.borrow_mut() = Some(exports.get("signals")?);
         Ok(())
     }
 
@@ -140,11 +149,57 @@ impl ScriptHost {
     /// character was spawned.
     pub fn start(&mut self) {
         script::start(&self.lua);
+        // Like on a server, the player joins after the scripts started.
+        let joined = {
+            let dom = self.ctx.dom.borrow();
+            let players = rig::service(&dom, "Players");
+            let player = players.and_then(|p| rig::child_of_class(&dom, p, "Player"));
+            players.zip(player).map(|(players, player)| (players, player, character(&dom, player)))
+        };
+        if let Some((players, player, character)) = joined {
+            events::fire(&self.lua, players, "PlayerAdded", InstanceRef(player));
+            if let Some(character) = character {
+                events::fire(&self.lua, player, "CharacterAdded", InstanceRef(character));
+            }
+        }
     }
 
-    /// Advances script time by `dt` seconds and resumes due threads.
+    /// Advances script time by `dt` seconds, resumes due threads and fires RunService's events.
     pub fn step(&mut self, dt: f64) {
         scheduler::step(&self.ctx, dt);
+        let run_service = rig::service(&self.ctx.dom.borrow(), "RunService");
+        if let Some(rs) = run_service {
+            let time = scheduler::now(&self.ctx);
+            events::fire(&self.lua, rs, "Stepped", (time, dt));
+            events::fire(&self.lua, rs, "PreSimulation", dt);
+            events::fire(&self.lua, rs, "PostSimulation", dt);
+            events::fire(&self.lua, rs, "Heartbeat", dt);
+            events::fire(&self.lua, rs, "PreRender", dt);
+            events::fire(&self.lua, rs, "RenderStepped", dt);
+        }
+    }
+
+    /// Fires `event` on `inst` with instances as arguments, e.g. a part's Touched(hit).
+    pub fn fire(&mut self, inst: Ref, event: &str, args: &[Ref]) {
+        let args: Vec<InstanceRef> = args.iter().copied().map(InstanceRef).collect();
+        events::fire(&self.lua, inst, event, mlua::Variadic::from_iter(args));
+    }
+
+    /// The player got a new character: runs its StarterCharacterScripts and fires CharacterAdded.
+    pub fn character_added(&mut self, character: Ref) {
+        script::character_added(&self.lua, character);
+        let player = {
+            let dom = self.ctx.dom.borrow();
+            rig::service(&dom, "Players").and_then(|p| rig::child_of_class(&dom, p, "Player"))
+        };
+        if let Some(player) = player {
+            events::fire(&self.lua, player, "CharacterAdded", InstanceRef(character));
+        }
+    }
+
+    /// Disconnects the events of instances the game removed (e.g. an old character).
+    pub fn forget(&mut self, gone: &[Ref]) {
+        events::forget(&self.lua, gone);
     }
 
     /// True if scripts changed the DOM since the last call.
@@ -167,5 +222,13 @@ impl Drop for ScriptHost {
         self.ctx.wait_marker.borrow_mut().take();
         self.ctx.instance_methods.borrow_mut().take();
         self.lua.remove_app_data::<Rc<Context>>();
+    }
+}
+
+/// The player's character, if it exists.
+fn character(dom: &WeakDom, player: Ref) -> Option<Ref> {
+    match dom.get_by_ref(player)?.properties.get(&"Character".into()) {
+        Some(kahua_io::rbx_dom_weak::types::Variant::Ref(c)) if dom.get_by_ref(*c).is_some() => Some(*c),
+        _ => None,
     }
 }

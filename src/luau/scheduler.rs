@@ -61,6 +61,11 @@ impl Scheduler {
     }
 }
 
+/// Script time in seconds.
+pub(crate) fn now(ctx: &Context) -> f64 {
+    ctx.scheduler.borrow().now
+}
+
 pub(crate) fn step(ctx: &Context, dt: f64) {
     let due = {
         let mut scheduler = ctx.scheduler.borrow_mut();

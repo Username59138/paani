@@ -460,3 +460,135 @@ fn wait_inside_coroutines_sleeps_the_coroutine() {
     assert!(errors(&output).is_empty(), "{:?}", errors(&output));
     assert_eq!(texts(&output), ["resumed", "ticks 4"]);
 }
+
+fn printed(source: &str, seconds: f64) -> Vec<String> {
+    let (mut host, _shared) = host_with_script(source);
+    run_for(&mut host, seconds);
+    let output = host.take_output();
+    assert!(errors(&output).is_empty(), "{:?}", errors(&output));
+    texts(&output)
+}
+
+#[test]
+fn signals_connect_disconnect_once_and_wait() {
+    let source = r#"
+        local event = Instance.new("BindableEvent")
+        local seen = {}
+        local connection = event.Event:Connect(function(value) table.insert(seen, "a" .. value) end)
+        event.Event:Once(function(value) table.insert(seen, "once" .. value) end)
+        assert(typeof(event.Event) == "RBXScriptSignal" and typeof(connection) == "RBXScriptConnection")
+        task.delay(0.2, function() event:Fire(3) end)
+        event:Fire(1)
+        connection:Disconnect()
+        assert(connection.Connected == false)
+        event:Fire(2)
+        local waited = event.Event:Wait()
+        print(table.concat(seen, " ") .. " waited " .. waited)
+    "#;
+    assert_eq!(printed(source, 0.5), ["a1 once1 waited 3"]);
+}
+
+#[test]
+fn property_changes_fire_changed() {
+    let source = r#"
+        local part = Instance.new("Part")
+        local changed = {}
+        part.Changed:Connect(function(property) table.insert(changed, property) end)
+        part:GetPropertyChangedSignal("Transparency"):Connect(function() table.insert(changed, "T!") end)
+        part:GetAttributeChangedSignal("Coins"):Connect(function() table.insert(changed, "coins!") end)
+        part.Transparency = 0.5
+        part.Name = "Thing"
+        part:SetAttribute("Coins", 3)
+        print(table.concat(changed, " "))
+    "#;
+    assert_eq!(printed(source, 0.1), ["Transparency T! Name coins!"]);
+}
+
+#[test]
+fn tree_events() {
+    let source = r#"
+        local log = {}
+        local folder = Instance.new("Folder", workspace)
+        folder.ChildAdded:Connect(function(child) table.insert(log, "added " .. child.Name) end)
+        folder.ChildRemoved:Connect(function(child) table.insert(log, "removed") end)
+        workspace.DescendantAdded:Connect(function(d) if d.Name == "Inner" then table.insert(log, "descendant") end end)
+        local part = Instance.new("Part")
+        part.Name = "Inner"
+        part.Destroying:Connect(function() table.insert(log, "destroying") end)
+        part.AncestryChanged:Connect(function(_, parent) table.insert(log, "ancestry " .. tostring(parent)) end)
+        part.Parent = folder
+        part:Destroy()
+        print(table.concat(log, ", "))
+    "#;
+    assert_eq!(printed(source, 0.1), ["added Inner, descendant, ancestry Folder, destroying, removed"]);
+}
+
+#[test]
+fn heartbeat_runs_every_step() {
+    let source = r#"
+        local frames, total = 0, 0
+        game:GetService("RunService").Heartbeat:Connect(function(dt)
+            frames += 1
+            total += dt
+        end)
+        wait(1)
+        print(frames >= 59 and frames <= 61, math.abs(total - frames / 60) < 1e-6)
+    "#;
+    assert_eq!(printed(source, 1.2), ["true true"]);
+}
+
+#[test]
+fn handler_errors_do_not_stop_other_handlers() {
+    let (mut host, _shared) = host_with_script(
+        r#"
+        local event = Instance.new("BindableEvent")
+        event.Event:Connect(function() error("boom") end)
+        event.Event:Connect(function() print("still runs") end)
+        event:Fire()
+    "#,
+    );
+    run_for(&mut host, 0.1);
+    let output = host.take_output();
+    assert_eq!(texts(&output), ["still runs"]);
+    assert_eq!(errors(&output).len(), 1);
+    assert!(errors(&output)[0].contains("boom"));
+}
+
+#[test]
+fn player_and_character_added_fire_after_scripts_start() {
+    let mut dom = template::baseplate();
+    crate::rig::spawn(&mut dom);
+    let sss = find(&dom, dom.root_ref(), "ServerScriptService").unwrap();
+    let source = r#"
+        game:GetService("Players").PlayerAdded:Connect(function(player)
+            print("joined " .. player.Name)
+            player.CharacterAdded:Connect(function(character)
+                character.Humanoid.Died:Connect(function() print("died") end)
+                print("character " .. character.Name)
+                character.Humanoid.Health = 0
+            end)
+        end)
+    "#;
+    add(&mut dom, sss, "Script", "Join", Some(source));
+    let mut host = ScriptHost::new(shared(dom), Options::default()).unwrap();
+    host.start();
+    run_for(&mut host, 0.1);
+    let output = host.take_output();
+    assert!(errors(&output).is_empty(), "{:?}", errors(&output));
+    assert_eq!(texts(&output), ["joined Player1", "character Player1", "died"]);
+}
+
+#[test]
+fn touched_is_fired_by_the_game() {
+    let (mut host, shared) = host_with_script(
+        r#"
+        workspace.Baseplate.Touched:Connect(function(hit) print("touched by " .. hit.Name) end)
+    "#,
+    );
+    let (baseplate, other) = {
+        let dom = shared.borrow();
+        (child_named(&dom, "Workspace", "Baseplate"), child_named(&dom, "Workspace", "SpawnLocation"))
+    };
+    host.fire(baseplate, "Touched", &[other]);
+    assert_eq!(texts(&host.take_output()), ["touched by SpawnLocation"]);
+}

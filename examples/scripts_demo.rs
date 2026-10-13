@@ -52,6 +52,40 @@ humanoid.WalkSpeed = 24
 print("Hello, " .. game:GetService("Players").LocalPlayer.Name .. "! WalkSpeed is now " .. humanoid.WalkSpeed)
 "#;
 
+/// The classic kill brick.
+const KILL_BRICK: &str = r#"
+script.Parent.Touched:Connect(function(hit)
+    local humanoid = hit.Parent:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        humanoid.Health = 0
+    end
+end)
+"#;
+
+/// A coin that disappears when the character touches it.
+const COIN: &str = r#"
+local coin = script.Parent
+coin.Touched:Connect(function(hit)
+    if hit.Parent:FindFirstChildOfClass("Humanoid") then
+        print("Coin collected!")
+        coin:Destroy()
+    end
+end)
+"#;
+
+/// Reports joins, deaths and respawns.
+const PLAYERS: &str = r#"
+game:GetService("Players").PlayerAdded:Connect(function(player)
+    print(player.Name .. " joined")
+    player.CharacterAdded:Connect(function(character)
+        print("Character spawned")
+        character:WaitForChild("Humanoid").Died:Connect(function()
+            print(player.Name .. " died")
+        end)
+    end)
+end)
+"#;
+
 fn script(class: &str, name: &str, source: &str) -> InstanceBuilder {
     InstanceBuilder::new(class).with_name(name).with_property("Source", source)
 }
@@ -92,6 +126,34 @@ fn main() -> anyhow::Result<()> {
         ),
     );
     dom.insert(rainbow, script("Script", "Colors", RAINBOW));
+
+    let kill_brick = dom.insert(
+        ws,
+        template::part(
+            "KillBrick",
+            "Part",
+            Vector3::new(12.0, 0.5, 0.0),
+            Vector3::new(4.0, 1.0, 8.0),
+            Color3::new(1.0, 0.1, 0.1),
+        ),
+    );
+    dom.insert(kill_brick, script("Script", "Kill", KILL_BRICK));
+
+    let coin = dom.insert(
+        ws,
+        template::part(
+            "Coin",
+            "Part",
+            Vector3::new(-12.0, 2.0, 0.0),
+            Vector3::new(0.4, 3.0, 3.0),
+            Color3::new(1.0, 0.8, 0.1),
+        )
+        .with_property("Shape", kahua_io::rbx_dom_weak::types::Enum::from_u32(2))
+        .with_property("CanCollide", false),
+    );
+    dom.insert(coin, script("Script", "Collect", COIN));
+
+    dom.insert(child(&dom, root, "ServerScriptService"), script("Script", "Players", PLAYERS));
 
     let starter_player = child(&dom, root, "StarterPlayer");
     dom.insert(child(&dom, starter_player, "StarterCharacterScripts"), script("LocalScript", "Speed", SPEED));

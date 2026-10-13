@@ -19,6 +19,9 @@ const RESTITUTION: f32 = 0.0;
 /// Joints that hold two parts rigidly together.
 const WELDS: [&str; 5] = ["WeldConstraint", "Weld", "ManualWeld", "Snap", "Motor6D"];
 
+/// Two parts, e.g. touching each other.
+pub type PartPair = (Ref, Ref);
+
 /// A part that physics moves.
 struct Moving {
     part: Ref,
@@ -32,6 +35,10 @@ struct Moving {
 pub struct Physics {
     world: rp::PhysicsWorld,
     moving: Vec<Moving>,
+    /// The part each collider belongs to, for Touched.
+    owners: HashMap<rp::ColliderHandle, Ref>,
+    /// Pairs of parts touching after the last step, smaller Ref first.
+    touching: HashSet<(Ref, Ref)>,
     /// Simulation time not yet stepped.
     pending: f32,
 }
@@ -81,6 +88,7 @@ impl Physics {
         }
         let scene_index: HashMap<Ref, usize> = scene.parts.iter().enumerate().map(|(i, p)| (p.owner, i)).collect();
         let mut moving = Vec::new();
+        let mut owners = HashMap::new();
         for list in members.values() {
             let anchored = list.iter().any(|&i| matches!(prop(parts[i], "Anchored"), Some(Variant::Bool(true))));
             // The first part's transform is the body's; the others hang off it.
@@ -89,7 +97,8 @@ impl Physics {
             let body = world.insert_body(builder.pose(to_pose(root)));
             for &i in list {
                 let relative = root.inverse() * transform(parts[i]);
-                world.insert_collider(collider(parts[i], relative), Some(body));
+                let handle = world.insert_collider(collider(parts[i], relative), Some(body));
+                owners.insert(handle, parts[i].referent());
                 if !anchored {
                     let part = parts[i].referent();
                     moving.push(Moving { part, scene: scene_index.get(&part).copied(), body, relative });
@@ -118,7 +127,14 @@ impl Physics {
         let dt = std::mem::replace(&mut world.integration_parameters.dt, 0.0);
         world.step();
         world.integration_parameters.dt = dt;
-        Self { world, moving, pending: previous.map_or(0.0, |p| p.pending) }
+        Self {
+            world,
+            moving,
+            owners,
+            // Carried over, so a rebuild doesn't fire Touched again for parts already touching.
+            touching: previous.map(|p| p.touching.clone()).unwrap_or_default(),
+            pending: previous.map_or(0.0, |p| p.pending),
+        }
     }
 
     /// Advances the simulation by `dt` seconds in fixed steps and moves the
@@ -179,10 +195,50 @@ impl Physics {
 
     /// Adds a kinematic upright capsule for a character. It pushes loose parts
     /// but moves only through `place_capsule` and `teleport_capsule`.
-    pub fn add_capsule(&mut self, center: Vec3, half_height: f32, radius: f32) -> Capsule {
+    /// `touch` is a box around the whole body (half size, offset from `center`)
+    /// that reports what the character touches as `part`: the capsule floats
+    /// above the feet, so it never touches the floor.
+    pub fn add_capsule(&mut self, center: Vec3, half_height: f32, radius: f32, touch: (Ref, Vec3, Vec3)) -> Capsule {
         let body = self.world.insert_body(rp::RigidBodyBuilder::kinematic_position_based().translation(vector(center)));
         self.world.insert_collider(rp::ColliderBuilder::capsule_y(half_height, radius), Some(body));
+        let (part, half, offset) = touch;
+        let sensor = rp::ColliderBuilder::cuboid(half.x, half.y, half.z)
+            .translation(vector(offset))
+            .sensor(true)
+            // Kinematic bodies don't touch anchored parts unless asked to.
+            .active_collision_types(rp::ActiveCollisionTypes::all());
+        let handle = self.world.insert_collider(sensor, Some(body));
+        self.owners.insert(handle, part);
         Capsule { body, shape: rp::SharedShape::capsule_y(half_height, radius) }
+    }
+
+    /// Pairs of parts that started and stopped touching since the last call.
+    pub fn touches(&mut self) -> (Vec<PartPair>, Vec<PartPair>) {
+        let narrow = &self.world.narrow_phase;
+        let mut now = HashSet::new();
+        let mut add = |a: rp::ColliderHandle, b: rp::ColliderHandle| {
+            if let (Some(&a), Some(&b)) = (self.owners.get(&a), self.owners.get(&b))
+                && a != b
+            {
+                now.insert(if a.to_string() < b.to_string() { (a, b) } else { (b, a) });
+            }
+        };
+        for &handle in self.owners.keys() {
+            for pair in narrow.contact_pairs_with(handle) {
+                if pair.has_any_active_contact() {
+                    add(pair.collider1, pair.collider2);
+                }
+            }
+            for (a, b, intersecting) in narrow.intersection_pairs_with(handle) {
+                if intersecting {
+                    add(a, b);
+                }
+            }
+        }
+        let started = now.difference(&self.touching).copied().collect();
+        let ended = self.touching.difference(&now).copied().collect();
+        self.touching = now;
+        (started, ended)
     }
 
     /// Moves the capsule centered at `center` by up to `desired`, sliding
@@ -223,10 +279,6 @@ impl Physics {
     /// Moves the capsule's body to `center` in the next step, pushing loose parts out of the way.
     pub fn place_capsule(&mut self, capsule: &Capsule, center: Vec3) {
         self.world.bodies[capsule.body].set_next_kinematic_translation(vector(center));
-    }
-
-    pub fn teleport_capsule(&mut self, capsule: &Capsule, center: Vec3) {
-        self.world.bodies[capsule.body].set_translation(vector(center), true);
     }
 }
 
