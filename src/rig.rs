@@ -110,7 +110,20 @@ pub fn spawn(dom: &mut WeakDom) -> Ref {
         Some(p) => p,
         None => dom.insert(dom.root_ref(), InstanceBuilder::new("Players").with_name("Players")),
     };
-    dom.insert(players, InstanceBuilder::new("Player").with_name(PLAYER_NAME).with_property("Character", model));
+    let player = dom
+        .get_by_ref(players)
+        .and_then(|p| p.children().iter().copied().find(|&r| dom.get_by_ref(r).is_some_and(|i| i.class == "Player")));
+    match player {
+        Some(player) => {
+            dom.get_by_ref_mut(player).unwrap().properties.insert(Ustr::from("Character"), Variant::Ref(model));
+        }
+        None => {
+            dom.insert(
+                players,
+                InstanceBuilder::new("Player").with_name(PLAYER_NAME).with_property("Character", model),
+            );
+        }
+    }
     model
 }
 

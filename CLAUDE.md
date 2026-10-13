@@ -16,12 +16,20 @@ Open-source Roblox place client in Rust. Companion to Kahua Studio (`../kahua`).
 - `src/rig.rs` builds the character into the DOM like Roblox (StarterCharacter or R6 rig, Humanoid
   with StarterPlayer settings, Player in Players). `src/character.rs` moves it like a Humanoid:
   hovers on floor raycasts (capsule only above STEP_HEIGHT), reads WalkSpeed/Jump* from the
-  Humanoid every frame. Not yet: writing the character's CFrame back to the DOM, R15, animations.
-- Test places: `examples/demo.rbxl` (Kahua's `demo_place` example), `examples/physics.rbxl`
+  Humanoid every frame. Not yet: R15, animations.
+- `src/luau/` runs Scripts/LocalScripts/ModuleScripts with mlua (Luau). `ScriptHost` shares the DOM
+  (`Rc<RefCell<WeakDom>>`); never hold a DOM borrow while calling into Lua. Waiting is done in
+  `prelude.luau` by yielding a marker that the scheduler catches (Rust functions can't yield).
+- Frame order (`App::tick`): physics + character write their CFrames into the DOM → scripts step →
+  if scripts changed the DOM, rebuild scene + physics (velocities kept, character re-attached, a
+  moved HumanoidRootPart = teleport) → character → physics. Physics::new does a zero-length step
+  so raycasts work right away. Rebuilding every frame is fine for small places; optimize later.
+- Test places: `examples/scripts.rbxl` (`scripts_demo` example; `app::tests` run the full loop),
+  `examples/demo.rbxl` (Kahua's `demo_place` example), `examples/physics.rbxl`
   (`cargo run --example physics_demo -- examples/physics.rbxl`; `cargo test` simulates it).
 - Usage limits are tight: one feature per session, keep changes small.
 
 ## Plan
-1. Engine (offline): ~~render places~~ → ~~physics~~ → ~~character~~ → Luau (mlua) → GUI
+1. Engine (offline): ~~render places~~ → ~~physics~~ → ~~character~~ → ~~Luau core~~ → Luau events (Touched, Heartbeat, Changed) → GUI
 2. Client: home screen, settings, graphics presets, profiles, stats (mockups exist)
 3. Online: Roblox servers, server browser. No cheat features.

@@ -12,6 +12,7 @@ git clone https://github.com/Username59138/paani
 cd paani
 cargo run --release -- examples/demo.rbxl
 cargo run --release -- examples/physics.rbxl   # things that fall
+cargo run --release -- examples/scripts.rbxl   # Luau scripts changing the world
 ```
 
 ## Controls
@@ -23,12 +24,12 @@ cargo run --release -- examples/physics.rbxl   # things that fall
 | Right mouse (hold) | Turn the camera |
 | Scroll | Zoom |
 | F | Free camera (WASD, Q/E down/up, Shift faster) |
-| R | Restart the physics |
+| R | Rejoin (reload the place and restart its scripts) |
 | Esc | Release the mouse |
 
 ## Roadmap
 
-1. **Engine** (offline): render places ✅, physics ✅, character ✅, Luau scripts
+1. **Engine** (offline): render places ✅, physics ✅, character ✅, Luau scripts (core ✅, events next)
 2. **Client**: home screen, settings, graphics presets, profiles, stats
 3. **Online**: join Roblox servers, server browser
 

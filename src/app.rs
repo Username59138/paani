@@ -1,10 +1,12 @@
 //! The window, the GPU, and the event loop.
 
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use kahua_io::rbx_dom_weak::WeakDom;
 use kahua_render::{COLOR_FORMAT, Camera, Overlay, Renderer, Scene, wgpu};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -17,6 +19,7 @@ use crate::blit::Blit;
 use crate::camera::{self, Orbit};
 use crate::character::Character;
 use crate::input::Input;
+use crate::luau::{Options, OutputLine, ScriptHost, SharedDom};
 use crate::physics::Physics;
 use crate::rig;
 
@@ -113,9 +116,11 @@ impl Gpu {
 
 pub struct App {
     title: String,
-    dom: WeakDom,
-    /// The scene as loaded, for restarting the simulation.
-    initial_scene: Scene,
+    path: PathBuf,
+    dom: SharedDom,
+    scripts: ScriptHost,
+    /// Recent script output, newest last.
+    console: Vec<OutputLine>,
     scene: Scene,
     physics: Physics,
     character: Character,
@@ -130,13 +135,15 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(mut dom: WeakDom, title: String) -> Self {
+    /// Opens a place: spawns the character and starts the scripts, like joining a game.
+    pub fn load(path: &Path, title: String) -> Result<Self> {
+        let mut dom = kahua_io::read_file(path).with_context(|| format!("failed to open {}", path.display()))?;
         let model = rig::spawn(&mut dom);
         let scene = Scene::extract(&dom);
         for warning in &scene.warnings {
             eprintln!("warning: {warning}");
         }
-        let mut physics = Physics::new(&dom, &scene, Some(model));
+        let mut physics = Physics::new(&dom, &scene, Some(model), None);
         let character = Character::new(&dom, model, &scene, &mut physics);
         let starter_player = rig::service(&dom, "StarterPlayer");
         let orbit = Orbit::new(
@@ -144,10 +151,17 @@ impl App {
             rig::float(&dom, starter_player, "CameraMinZoomDistance", 0.5),
             rig::float(&dom, starter_player, "CameraMaxZoomDistance", 400.0),
         );
+        character.write_back(&mut dom);
+        let dom: SharedDom = Rc::new(RefCell::new(dom));
+        let mut scripts = ScriptHost::new(dom.clone(), Options::default())
+            .map_err(|err| anyhow::anyhow!("failed to start Luau: {err}"))?;
+        scripts.start();
         let mut app = Self {
             title,
+            path: path.to_path_buf(),
             dom,
-            initial_scene: scene.clone(),
+            scripts,
+            console: Vec::new(),
             scene,
             physics,
             character,
@@ -159,19 +173,41 @@ impl App {
             last_frame: Instant::now(),
             fps_window: (Instant::now(), 0),
         };
-        app.character.place(&mut app.scene);
-        app
+        app.sync_scripts();
+        Ok(app)
     }
 
-    /// Puts every part back where it was loaded and starts the simulation over.
+    /// Loads the place again from its file, like rejoining.
     fn restart(&mut self) {
-        self.scene = self.initial_scene.clone();
-        self.physics = Physics::new(&self.dom, &self.scene, Some(self.character.model));
-        self.character = Character::new(&self.dom, self.character.model, &self.scene, &mut self.physics);
-        self.character.place(&mut self.scene);
-        if let Some(gpu) = &mut self.gpu {
-            gpu.set_scene(&self.scene);
+        match App::load(&self.path, self.title.clone()) {
+            Ok(fresh) => {
+                let gpu = self.gpu.take();
+                *self = fresh;
+                self.gpu = gpu;
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.set_scene(&self.scene);
+                }
+            }
+            Err(err) => eprintln!("error: {err:#}"),
         }
+    }
+
+    /// Rebuilds the scene and physics if scripts changed the place. Moving
+    /// parts keep their velocity and the character stays where it is, unless
+    /// a script moved it.
+    fn sync_scripts(&mut self) {
+        // The host also prints the output; this copy is for the in-game console.
+        const CONSOLE_LINES: usize = 500;
+        self.console.extend(self.scripts.take_output());
+        let excess = self.console.len().saturating_sub(CONSOLE_LINES);
+        self.console.drain(..excess);
+        if !self.scripts.take_dirty() {
+            return;
+        }
+        let dom = self.dom.borrow();
+        self.scene = Scene::extract(&dom);
+        self.physics = Physics::new(&dom, &self.scene, Some(self.character.model), Some(&self.physics));
+        self.character.reattach(&dom, &self.scene, &mut self.physics);
     }
 
     /// Returns the error that stopped the event loop, if any.
@@ -197,23 +233,7 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
-
-        let look = self.input.take_look();
-        let scroll = self.input.take_scroll();
-        let camera = match &mut self.free_camera {
-            Some(camera) => {
-                camera::fly(camera, &self.input, look, dt);
-                *camera
-            }
-            None => {
-                self.orbit.update(look, scroll);
-                self.character.update(&self.dom, &self.input, self.orbit.yaw, dt, &mut self.physics);
-                self.orbit.camera(self.character.focus())
-            }
-        };
-        self.physics.update(dt, &mut self.scene);
-        // The character moves almost every frame, so always upload.
-        self.character.place(&mut self.scene);
+        let camera = self.tick(dt);
 
         let Some(gpu) = &mut self.gpu else { return };
         gpu.set_scene(&self.scene);
@@ -227,6 +247,37 @@ impl App {
             self.fps_window = (now, 0);
         }
         gpu.window.request_redraw();
+    }
+
+    /// Advances the game by `dt` seconds: scripts, character, physics. Returns
+    /// the camera to draw with.
+    fn tick(&mut self, dt: f32) -> Camera {
+        // Scripts see where things are now, then may change them.
+        {
+            let mut dom = self.dom.borrow_mut();
+            self.physics.write_back(&mut dom);
+            self.character.write_back(&mut dom);
+        }
+        self.scripts.step(dt as f64);
+        self.sync_scripts();
+
+        let look = self.input.take_look();
+        let scroll = self.input.take_scroll();
+        let camera = match &mut self.free_camera {
+            Some(camera) => {
+                camera::fly(camera, &self.input, look, dt);
+                *camera
+            }
+            None => {
+                self.orbit.update(look, scroll);
+                let dom = self.dom.borrow();
+                self.character.update(&dom, &self.input, self.orbit.yaw, dt, &mut self.physics);
+                self.orbit.camera(self.character.focus())
+            }
+        };
+        self.physics.update(dt, &mut self.scene);
+        self.character.place(&mut self.scene);
+        camera
     }
 }
 
@@ -287,5 +338,87 @@ impl ApplicationHandler for App {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             self.input.mouse_moved(dx, dy);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kahua_io::rbx_dom_weak::InstanceBuilder;
+    use kahua_io::rbx_dom_weak::types::Variant;
+    use kahua_io::template;
+    use kahua_render::glam::Vec3;
+    use kahua_render::scene::{cframe_to_mat4, part_cframe};
+
+    use super::*;
+    use crate::luau::OutputKind;
+
+    fn run(app: &mut App, seconds: f32) {
+        for _ in 0..(seconds * 60.0) as usize {
+            app.tick(1.0 / 60.0);
+        }
+    }
+
+    fn errors(app: &App) -> Vec<&str> {
+        app.console.iter().filter(|l| l.kind == OutputKind::Error).map(|l| l.text.as_str()).collect()
+    }
+
+    /// Where the named part in Workspace is, and its forward direction.
+    fn part(app: &App, name: &str) -> Option<(Vec3, Vec3)> {
+        let dom = app.dom.borrow();
+        let part = dom.descendants().find(|i| i.name == name)?;
+        let transform = cframe_to_mat4(&part_cframe(part)?);
+        Some((transform.w_axis.truncate(), transform.transform_vector3(Vec3::NEG_Z)))
+    }
+
+    #[test]
+    fn scripts_change_the_world() {
+        let mut app = App::load(Path::new("examples/scripts.rbxl"), String::new()).unwrap();
+        let spinner_before = part(&app, "Spinner").unwrap().1;
+        run(&mut app, 0.5);
+        // The spinner turns 2 degrees per frame: 60 degrees in half a second.
+        let turned = part(&app, "Spinner").unwrap().1.angle_between(spinner_before).to_degrees();
+        assert!((turned - 60.0).abs() < 4.0, "turned {turned}");
+        run(&mut app, 2.5);
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+
+        // Balls appear every half second and fall onto the baseplate.
+        assert!(part(&app, "Ball6").is_some() && part(&app, "Ball8").is_none());
+        let (ball, _) = part(&app, "Ball1").unwrap();
+        assert!(ball.y < 10.0, "the first ball fell: {ball}");
+        assert!(app.scene.parts.len() > 6, "new parts are drawn");
+
+        // The LocalScript in StarterCharacterScripts made the character faster.
+        assert!(app.console.iter().any(|l| l.text == "Hello, Player1! WalkSpeed is now 24"));
+        // Walk away from the balls.
+        let start = app.character.position;
+        app.input.key(KeyCode::KeyS, true);
+        run(&mut app, 1.0);
+        let walked = app.character.position - start;
+        assert!((walked.length() - 24.0).abs() < 1.5, "walked {walked}");
+    }
+
+    #[test]
+    fn scripts_can_teleport_the_character() {
+        let mut dom = template::baseplate();
+        let source = "wait(1) workspace.Player1.HumanoidRootPart.CFrame = CFrame.new(50, 20, 50)";
+        let workspace = template::workspace(&dom);
+        dom.insert(workspace, InstanceBuilder::new("Script").with_property("Source", source));
+        let path = std::env::temp_dir().join(format!("paani-teleport-{}.rbxl", std::process::id()));
+        kahua_io::write_file(&dom, &path).unwrap();
+        let mut app = App::load(&path, String::new()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        run(&mut app, 0.5);
+        assert!(app.character.position.x.abs() < 1.0);
+        run(&mut app, 2.0);
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        let at = app.character.position;
+        // Teleported, then fell onto the baseplate (top at y = 0, root 3 studs above the feet).
+        assert!((at - Vec3::new(50.0, 3.0, 50.0)).length() < 0.1, "at {at}");
+        // Scripts read the character where it is.
+        let dom = app.dom.borrow();
+        let root = dom.descendants().find(|i| i.name == "HumanoidRootPart").unwrap();
+        let Some(Variant::CFrame(cf)) = root.properties.get(&"CFrame".into()) else { panic!() };
+        assert!((cf.position.x - 50.0).abs() < 0.1);
     }
 }

@@ -5,14 +5,14 @@
 //! The Humanoid's properties are read every frame, so changing them in the
 //! DOM (later: from scripts) takes effect right away.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
 
 use kahua_io::rbx_dom_weak::WeakDom;
 use kahua_io::rbx_dom_weak::types::{Ref, Variant};
 use kahua_render::Scene;
 use kahua_render::glam::{Mat4, Quat, Vec3};
-use kahua_render::scene::{bounds_of, cframe_to_mat4, part_cframe, part_size, prop, world_root};
+use kahua_render::scene::{bounds_of, cframe_to_mat4, mat4_to_cframe, part_cframe, part_size, prop, world_root};
 use winit::keyboard::KeyCode;
 
 use crate::input::Input;
@@ -32,16 +32,20 @@ const FLOOR_SNAP: f32 = 0.6;
 
 pub struct Character {
     pub model: Ref,
+    root: Ref,
     humanoid: Ref,
-    /// Visible parts: (index in `Scene::parts`, transform relative to the root frame).
+    /// Every part of the character with its transform relative to the root frame.
+    members: Vec<(Ref, Mat4)>,
+    /// The visible ones: (index in `Scene::parts`, transform relative to the root frame).
     parts: Vec<(usize, Mat4)>,
     capsule: Capsule,
     /// From the root frame to the capsule's center.
     capsule_offset: Vec3,
+    half_height: f32,
+    radius: f32,
     /// From the root down to the feet (negative).
     feet: f32,
     step: f32,
-    radius: f32,
     /// Root position when standing on the spawn point.
     spawn: Vec3,
     pub position: Vec3,
@@ -64,47 +68,68 @@ impl Character {
                 .unwrap_or(model),
         };
         let humanoid = child_of_class(dom, model, "Humanoid").unwrap_or(model);
-        let root_inst = dom.get_by_ref(root).unwrap();
-        let root_transform = part_cframe(root_inst).map(|cf| cframe_to_mat4(&cf)).unwrap_or_default();
-        let forward = root_transform.transform_vector3(Vec3::NEG_Z);
-        let yaw = (-forward.x).atan2(-forward.z);
-        let root_frame = frame(root_transform.w_axis.truncate(), yaw);
-
-        let members: HashSet<Ref> = dom.descendants_of(model).map(|i| i.referent()).collect();
-        let parts: Vec<(usize, Mat4)> = scene
-            .parts
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| members.contains(&p.owner))
-            .map(|(i, p)| (i, root_frame.inverse() * p.transform))
+        let (position, yaw) = root_frame(dom, root).unwrap_or_default();
+        let inverse = frame(position, yaw).inverse();
+        let members: Vec<(Ref, Mat4)> = dom
+            .descendants_of(model)
+            .filter_map(|i| Some((i.referent(), inverse * cframe_to_mat4(&part_cframe(i)?))))
             .collect();
+        let parts = visible(&members, scene);
 
         // A capsule as tall as the visible body and as wide as the root part.
-        let inverse = root_frame.inverse();
         let corners = parts.iter().flat_map(|&(i, _)| scene.parts[i].corners()).map(|c| inverse.transform_point3(c));
         let (min, max) = bounds_of(corners).unwrap_or((Vec3::splat(-2.5), Vec3::splat(2.5)));
         let step = STEP_HEIGHT.min((max.y - min.y) * 0.4);
         let bottom = min.y + step;
         let height = max.y - bottom;
-        let radius = (part_size(root_inst).x * 0.5).clamp(0.2, height * 0.5);
+        let root_width = dom.get_by_ref(root).map_or(2.0, |r| part_size(r).x);
+        let radius = (root_width * 0.5).clamp(0.2, height * 0.5);
+        let half_height = (height * 0.5 - radius).max(0.01);
         let capsule_offset = Vec3::new(0.0, (bottom + max.y) * 0.5, 0.0);
 
         let spawn = spawn_point(dom, physics) - Vec3::new(0.0, min.y, 0.0);
-        let capsule = physics.add_capsule(spawn + capsule_offset, (height * 0.5 - radius).max(0.01), radius);
+        let capsule = physics.add_capsule(spawn + capsule_offset, half_height, radius);
         Self {
             model,
+            root,
             humanoid,
+            members,
             parts,
             capsule,
             capsule_offset,
+            half_height,
+            radius,
             feet: min.y,
             step,
-            radius,
             spawn,
             position: spawn,
             yaw,
             vertical_speed: 0.0,
             grounded: false,
+        }
+    }
+
+    /// Hooks the character up to a rebuilt scene and physics world. If a script
+    /// moved the root part (a teleport), the character continues from there.
+    pub fn reattach(&mut self, dom: &WeakDom, scene: &Scene, physics: &mut Physics) {
+        if let Some((position, yaw)) = root_frame(dom, self.root)
+            && (position.distance(self.position) > 1e-3 || (yaw - self.yaw).abs() > 1e-3)
+        {
+            self.position = position;
+            self.yaw = yaw;
+            self.vertical_speed = 0.0;
+        }
+        self.parts = visible(&self.members, scene);
+        self.capsule = physics.add_capsule(self.position + self.capsule_offset, self.half_height, self.radius);
+    }
+
+    /// Writes the character's parts' CFrames, so scripts see where it is.
+    pub fn write_back(&self, dom: &mut WeakDom) {
+        let root = frame(self.position, self.yaw);
+        for &(part, relative) in &self.members {
+            if let Some(part) = dom.get_by_ref_mut(part) {
+                part.properties.insert("CFrame".into(), Variant::CFrame(mat4_to_cframe(&(root * relative))));
+            }
         }
     }
 
@@ -195,6 +220,19 @@ impl Character {
     }
 }
 
+/// The position and facing of the root part, if it still exists.
+fn root_frame(dom: &WeakDom, root: Ref) -> Option<(Vec3, f32)> {
+    let transform = cframe_to_mat4(&part_cframe(dom.get_by_ref(root)?)?);
+    let forward = transform.transform_vector3(Vec3::NEG_Z);
+    Some((transform.w_axis.truncate(), (-forward.x).atan2(-forward.z)))
+}
+
+/// The members that are drawn, with their index in the scene.
+fn visible(members: &[(Ref, Mat4)], scene: &Scene) -> Vec<(usize, Mat4)> {
+    let relative: HashMap<Ref, Mat4> = members.iter().copied().collect();
+    scene.parts.iter().enumerate().filter_map(|(i, p)| Some((i, *relative.get(&p.owner)?))).collect()
+}
+
 /// An upright frame at `position` facing `yaw`.
 fn frame(position: Vec3, yaw: f32) -> Mat4 {
     Mat4::from_rotation_translation(Quat::from_rotation_y(yaw), position)
@@ -234,7 +272,7 @@ mod tests {
             let mut dom = kahua_io::read_file(std::path::Path::new(path)).unwrap();
             let model = rig::spawn(&mut dom);
             let scene = Scene::extract(&dom);
-            let mut physics = Physics::new(&dom, &scene, Some(model));
+            let mut physics = Physics::new(&dom, &scene, Some(model), None);
             let character = Character::new(&dom, model, &scene, &mut physics);
             Self { dom, scene, physics, character, input: Input::default() }
         }

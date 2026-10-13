@@ -11,9 +11,6 @@ use super::scheduler::run_thread;
 use super::{Context, OutputKind, context};
 use crate::rig;
 
-/// Roblox's RunContext enum value for Client.
-const RUN_CONTEXT_CLIENT: u32 = 2;
-
 /// Runs the place's scripts. Server scripts run in DOM order; then the local
 /// scripts are cloned into the player and run. Errors are reported per script.
 pub(crate) fn start(lua: &Lua) {

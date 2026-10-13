@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use kahua_io::rbx_dom_weak::types::{Ref, Variant};
 use kahua_io::rbx_dom_weak::{Instance, WeakDom};
 use kahua_render::glam::{Mat4, Quat, Vec3};
-use kahua_render::scene::{cframe_to_mat4, is_renderable, part_cframe, part_size, prop, world_root};
+use kahua_render::scene::{cframe_to_mat4, is_renderable, mat4_to_cframe, part_cframe, part_size, prop, world_root};
 use kahua_render::{Scene, Shape, mesh};
 use rapier3d::control::{CharacterLength, KinematicCharacterController};
 use rapier3d::prelude as rp;
@@ -19,18 +19,29 @@ const RESTITUTION: f32 = 0.0;
 /// Joints that hold two parts rigidly together.
 const WELDS: [&str; 5] = ["WeldConstraint", "Weld", "ManualWeld", "Snap", "Motor6D"];
 
+/// A part that physics moves.
+struct Moving {
+    part: Ref,
+    /// Index in `Scene::parts`, for visible parts.
+    scene: Option<usize>,
+    body: rp::RigidBodyHandle,
+    /// The part's transform relative to its body.
+    relative: Mat4,
+}
+
 pub struct Physics {
     world: rp::PhysicsWorld,
-    /// Visible parts that can move: (index in `Scene::parts`, body, part transform relative to the body).
-    moving: Vec<(usize, rp::RigidBodyHandle, Mat4)>,
+    moving: Vec<Moving>,
     /// Simulation time not yet stepped.
     pending: f32,
 }
 
 impl Physics {
     /// Builds bodies for the parts in Workspace, except those inside `skip`
-    /// (the character, which moves on its own).
-    pub fn new(dom: &WeakDom, scene: &Scene, skip: Option<Ref>) -> Self {
+    /// (the character, which moves on its own). Parts that were moving in
+    /// `previous` keep their velocity, so rebuilding after a script changed
+    /// the place doesn't stop falling parts.
+    pub fn new(dom: &WeakDom, scene: &Scene, skip: Option<Ref>, previous: Option<&Physics>) -> Self {
         let mut world = rp::PhysicsWorld::new();
         let gravity = match dom.get_by_ref(world_root(dom)).and_then(|ws| prop(ws, "Gravity")) {
             Some(Variant::Float32(g)) => *g,
@@ -79,12 +90,35 @@ impl Physics {
             for &i in list {
                 let relative = root.inverse() * transform(parts[i]);
                 world.insert_collider(collider(parts[i], relative), Some(body));
-                if !anchored && let Some(&s) = scene_index.get(&parts[i].referent()) {
-                    moving.push((s, body, relative));
+                if !anchored {
+                    let part = parts[i].referent();
+                    moving.push(Moving { part, scene: scene_index.get(&part).copied(), body, relative });
                 }
             }
         }
-        Self { world, moving, pending: 0.0 }
+        if let Some(previous) = previous {
+            let velocities: HashMap<Ref, (rp::Vector, rp::Vector)> = previous
+                .moving
+                .iter()
+                .map(|m| {
+                    let body = &previous.world.bodies[m.body];
+                    (m.part, (body.linvel(), body.angvel()))
+                })
+                .collect();
+            for m in &moving {
+                if let Some(&(linear, angular)) = velocities.get(&m.part) {
+                    let body = &mut world.bodies[m.body];
+                    body.set_linvel(linear, true);
+                    body.set_angvel(angular, true);
+                }
+            }
+        }
+        // Raycasts (floors, spawning) only see colliders after the first step.
+        // A zero-length step registers everything without moving anything.
+        let dt = std::mem::replace(&mut world.integration_parameters.dt, 0.0);
+        world.step();
+        world.integration_parameters.dt = dt;
+        Self { world, moving, pending: previous.map_or(0.0, |p| p.pending) }
     }
 
     /// Advances the simulation by `dt` seconds in fixed steps and moves the
@@ -103,14 +137,30 @@ impl Physics {
             return false;
         }
         let mut moved = false;
-        for &(i, body, relative) in &self.moving {
-            let body = &self.world.bodies[body];
-            if !body.is_sleeping() {
-                scene.parts[i].transform = from_pose(body.position()) * relative;
+        for m in &self.moving {
+            let body = &self.world.bodies[m.body];
+            if let Some(i) = m.scene
+                && !body.is_sleeping()
+            {
+                scene.parts[i].transform = from_pose(body.position()) * m.relative;
                 moved = true;
             }
         }
         moved
+    }
+
+    /// Writes where the moving parts are into their CFrames, so scripts read current positions.
+    pub fn write_back(&self, dom: &mut WeakDom) {
+        for m in &self.moving {
+            let body = &self.world.bodies[m.body];
+            if body.is_sleeping() {
+                continue;
+            }
+            if let Some(part) = dom.get_by_ref_mut(m.part) {
+                let cframe = mat4_to_cframe(&(from_pose(body.position()) * m.relative));
+                part.properties.insert("CFrame".into(), Variant::CFrame(cframe));
+            }
+        }
     }
 }
 
@@ -288,7 +338,7 @@ mod tests {
     fn settle(seconds: f32) -> HashMap<String, Vec3> {
         let dom = kahua_io::read_file(std::path::Path::new("examples/physics.rbxl")).unwrap();
         let mut scene = Scene::extract(&dom);
-        let mut physics = Physics::new(&dom, &scene, None);
+        let mut physics = Physics::new(&dom, &scene, None, None);
         for _ in 0..(seconds * 60.0) as usize {
             physics.update(1.0 / 60.0, &mut scene);
         }
