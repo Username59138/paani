@@ -5,17 +5,20 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use kahua_io::rbx_dom_weak::WeakDom;
-use kahua_render::{COLOR_FORMAT, Camera, Overlay, Renderer, Scene, default_camera, wgpu};
+use kahua_render::{COLOR_FORMAT, Camera, Overlay, Renderer, Scene, wgpu};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{DeviceEvent, DeviceId, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::blit::Blit;
-use crate::fly::FlyCamera;
+use crate::camera::{self, Orbit};
+use crate::character::Character;
+use crate::input::Input;
 use crate::physics::Physics;
+use crate::rig;
 
 struct Gpu {
     window: Arc<Window>,
@@ -115,7 +118,11 @@ pub struct App {
     initial_scene: Scene,
     scene: Scene,
     physics: Physics,
-    fly: FlyCamera,
+    character: Character,
+    orbit: Orbit,
+    /// Set while the free camera (F) is on; the character then stands still.
+    free_camera: Option<Camera>,
+    input: Input,
     gpu: Option<Gpu>,
     error: Option<anyhow::Error>,
     last_frame: Instant,
@@ -123,31 +130,45 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dom: WeakDom, title: String) -> Self {
+    pub fn new(mut dom: WeakDom, title: String) -> Self {
+        let model = rig::spawn(&mut dom);
         let scene = Scene::extract(&dom);
         for warning in &scene.warnings {
             eprintln!("warning: {warning}");
         }
-        let physics = Physics::new(&dom, &scene);
-        let fly = FlyCamera::new(default_camera(&scene));
-        Self {
+        let mut physics = Physics::new(&dom, &scene, Some(model));
+        let character = Character::new(&dom, model, &scene, &mut physics);
+        let starter_player = rig::service(&dom, "StarterPlayer");
+        let orbit = Orbit::new(
+            character.yaw,
+            rig::float(&dom, starter_player, "CameraMinZoomDistance", 0.5),
+            rig::float(&dom, starter_player, "CameraMaxZoomDistance", 400.0),
+        );
+        let mut app = Self {
             title,
             dom,
             initial_scene: scene.clone(),
             scene,
             physics,
-            fly,
+            character,
+            orbit,
+            free_camera: None,
+            input: Input::default(),
             gpu: None,
             error: None,
             last_frame: Instant::now(),
             fps_window: (Instant::now(), 0),
-        }
+        };
+        app.character.place(&mut app.scene);
+        app
     }
 
     /// Puts every part back where it was loaded and starts the simulation over.
     fn restart(&mut self) {
         self.scene = self.initial_scene.clone();
-        self.physics = Physics::new(&self.dom, &self.scene);
+        self.physics = Physics::new(&self.dom, &self.scene, Some(self.character.model));
+        self.character = Character::new(&self.dom, self.character.model, &self.scene, &mut self.physics);
+        self.character.place(&mut self.scene);
         if let Some(gpu) = &mut self.gpu {
             gpu.set_scene(&self.scene);
         }
@@ -159,24 +180,44 @@ impl App {
     }
 
     fn set_looking(&mut self, looking: bool) {
-        self.fly.looking = looking;
+        self.input.looking = looking;
         if let Some(gpu) = &self.gpu {
             gpu.set_cursor_captured(looking);
         }
+    }
+
+    fn toggle_free_camera(&mut self) {
+        self.free_camera = match self.free_camera {
+            Some(_) => None,
+            None => Some(self.orbit.camera(self.character.focus())),
+        };
     }
 
     fn redraw(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
-        self.fly.update(dt);
-        let moved = self.physics.update(dt, &mut self.scene);
+
+        let look = self.input.take_look();
+        let scroll = self.input.take_scroll();
+        let camera = match &mut self.free_camera {
+            Some(camera) => {
+                camera::fly(camera, &self.input, look, dt);
+                *camera
+            }
+            None => {
+                self.orbit.update(look, scroll);
+                self.character.update(&self.dom, &self.input, self.orbit.yaw, dt, &mut self.physics);
+                self.orbit.camera(self.character.focus())
+            }
+        };
+        self.physics.update(dt, &mut self.scene);
+        // The character moves almost every frame, so always upload.
+        self.character.place(&mut self.scene);
 
         let Some(gpu) = &mut self.gpu else { return };
-        if moved {
-            gpu.set_scene(&self.scene);
-        }
-        gpu.draw(&self.fly.camera);
+        gpu.set_scene(&self.scene);
+        gpu.draw(&camera);
 
         let (start, frames) = &mut self.fps_window;
         *frames += 1;
@@ -215,21 +256,28 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => {
-                self.fly.release_all();
+                self.input.release_all();
                 self.set_looking(false);
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if code == KeyCode::Escape {
-                        self.set_looking(false);
-                    }
-                    if code == KeyCode::KeyR && event.state.is_pressed() && !event.repeat {
-                        self.restart();
-                    }
-                    self.fly.key(code, event.state.is_pressed());
+                let PhysicalKey::Code(code) = event.physical_key else { return };
+                let pressed = event.state.is_pressed();
+                self.input.key(code, pressed);
+                if !pressed || event.repeat {
+                    return;
+                }
+                match code {
+                    KeyCode::Escape => self.set_looking(false),
+                    KeyCode::KeyR => self.restart(),
+                    KeyCode::KeyF => self.toggle_free_camera(),
+                    _ => {}
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => self.set_looking(state.is_pressed()),
+            WindowEvent::MouseWheel { delta, .. } => self.input.scrolled(match delta {
+                MouseScrollDelta::LineDelta(_, y) => y,
+                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+            }),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
@@ -237,7 +285,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            self.fly.mouse_moved(dx, dy);
+            self.input.mouse_moved(dx, dy);
         }
     }
 }

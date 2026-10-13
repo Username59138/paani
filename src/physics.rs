@@ -1,13 +1,14 @@
 //! Rigid-body physics with rapier. Parts joined by welds move as one body,
 //! like Roblox assemblies, and an assembly with any anchored part stays still.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kahua_io::rbx_dom_weak::types::{Ref, Variant};
 use kahua_io::rbx_dom_weak::{Instance, WeakDom};
 use kahua_render::glam::{Mat4, Quat, Vec3};
 use kahua_render::scene::{cframe_to_mat4, is_renderable, part_cframe, part_size, prop, world_root};
 use kahua_render::{Scene, Shape, mesh};
+use rapier3d::control::{CharacterLength, KinematicCharacterController};
 use rapier3d::prelude as rp;
 
 /// Workspace.Gravity's default, in studs/s².
@@ -27,17 +28,27 @@ pub struct Physics {
 }
 
 impl Physics {
-    pub fn new(dom: &WeakDom, scene: &Scene) -> Self {
+    /// Builds bodies for the parts in Workspace, except those inside `skip`
+    /// (the character, which moves on its own).
+    pub fn new(dom: &WeakDom, scene: &Scene, skip: Option<Ref>) -> Self {
         let mut world = rp::PhysicsWorld::new();
         let gravity = match dom.get_by_ref(world_root(dom)).and_then(|ws| prop(ws, "Gravity")) {
             Some(Variant::Float32(g)) => *g,
             _ => DEFAULT_GRAVITY,
         };
         world.gravity = rp::Vector::new(0.0, -gravity, 0.0);
+        // Roblox simulates at 240 Hz. Its gravity is strong in studs, so contacts
+        // also need to be stiffer than rapier's default or stacks sink into each other.
+        world.integration_parameters.dt = 1.0 / 240.0;
+        world.integration_parameters.contact_softness.natural_frequency = 100.0;
 
         // Invisible parts are not in the scene but still collide, so read parts from the DOM.
-        let parts: Vec<&Instance> =
-            dom.descendants_of(world_root(dom)).filter(|i| is_renderable(i) && part_cframe(i).is_some()).collect();
+        let skipped: HashSet<Ref> =
+            skip.map(|r| dom.descendants_of(r).map(|i| i.referent()).collect()).unwrap_or_default();
+        let parts: Vec<&Instance> = dom
+            .descendants_of(world_root(dom))
+            .filter(|i| is_renderable(i) && part_cframe(i).is_some() && !skipped.contains(&i.referent()))
+            .collect();
         let index: HashMap<Ref, usize> = parts.iter().enumerate().map(|(i, p)| (p.referent(), i)).collect();
         let mut assemblies = UnionFind::new(parts.len());
         for joint in dom.descendants_of(world_root(dom)).filter(|i| WELDS.contains(&i.class.as_str())) {
@@ -81,7 +92,7 @@ impl Physics {
     pub fn update(&mut self, dt: f32, scene: &mut Scene) -> bool {
         let step = self.world.integration_parameters.dt;
         // Don't try to catch up after a long stall, it would stall again.
-        self.pending = (self.pending + dt).min(step * 8.0);
+        self.pending = (self.pending + dt).min(0.1);
         let mut stepped = false;
         while self.pending >= step {
             self.world.step();
@@ -101,6 +112,89 @@ impl Physics {
         }
         moved
     }
+}
+
+impl Physics {
+    pub fn gravity(&self) -> f32 {
+        -self.world.gravity.y
+    }
+
+    /// The height of the highest solid surface below (x, z), if any.
+    pub fn ground_below(&self, x: f32, z: f32) -> Option<f32> {
+        const TOP: f32 = 1.0e5;
+        let ray = rp::Ray::new(rp::Vector::new(x, TOP, z), rp::Vector::NEG_Y);
+        let queries = self.world.query_pipeline_with_filter(rp::QueryFilter::default().exclude_sensors());
+        queries.cast_ray(&ray, 2.0 * TOP, true).map(|(_, toi)| TOP - toi)
+    }
+
+    /// Adds a kinematic upright capsule for a character. It pushes loose parts
+    /// but moves only through `place_capsule` and `teleport_capsule`.
+    pub fn add_capsule(&mut self, center: Vec3, half_height: f32, radius: f32) -> Capsule {
+        let body = self.world.insert_body(rp::RigidBodyBuilder::kinematic_position_based().translation(vector(center)));
+        self.world.insert_collider(rp::ColliderBuilder::capsule_y(half_height, radius), Some(body));
+        Capsule { body, shape: rp::SharedShape::capsule_y(half_height, radius) }
+    }
+
+    /// Moves the capsule centered at `center` by up to `desired`, sliding
+    /// along walls and slopes steeper than `max_slope` radians. Returns how
+    /// far it can move. Standing on floors is up to the caller (see `floor_below`).
+    pub fn move_capsule(&self, capsule: &Capsule, center: Vec3, desired: Vec3, dt: f32, max_slope: f32) -> Vec3 {
+        let controller = KinematicCharacterController {
+            offset: CharacterLength::Absolute(0.02),
+            max_slope_climb_angle: max_slope,
+            min_slope_slide_angle: max_slope,
+            snap_to_ground: None,
+            ..Default::default()
+        };
+        let movement = controller.move_shape(
+            dt,
+            &self.world.query_pipeline_with_filter(capsule.filter()),
+            &*capsule.shape,
+            &rp::Pose::from_translation(vector(center)),
+            vector(desired),
+            |_| {},
+        );
+        Vec3::from_array(movement.translation.to_array())
+    }
+
+    /// The highest solid surface hit by rays going down `length` studs from
+    /// each of `origins`, ignoring the capsule itself.
+    pub fn floor_below(&self, capsule: &Capsule, origins: &[Vec3], length: f32) -> Option<f32> {
+        let queries = self.world.query_pipeline_with_filter(capsule.filter());
+        origins
+            .iter()
+            .filter_map(|o| {
+                let ray = rp::Ray::new(vector(*o), rp::Vector::NEG_Y);
+                queries.cast_ray(&ray, length, true).map(|(_, toi)| o.y - toi)
+            })
+            .reduce(f32::max)
+    }
+
+    /// Moves the capsule's body to `center` in the next step, pushing loose parts out of the way.
+    pub fn place_capsule(&mut self, capsule: &Capsule, center: Vec3) {
+        self.world.bodies[capsule.body].set_next_kinematic_translation(vector(center));
+    }
+
+    pub fn teleport_capsule(&mut self, capsule: &Capsule, center: Vec3) {
+        self.world.bodies[capsule.body].set_translation(vector(center), true);
+    }
+}
+
+/// A character's body in the physics world.
+pub struct Capsule {
+    body: rp::RigidBodyHandle,
+    shape: rp::SharedShape,
+}
+
+impl Capsule {
+    /// Scene queries for the character: everything solid except itself.
+    fn filter(&self) -> rp::QueryFilter<'static> {
+        rp::QueryFilter::default().exclude_rigid_body(self.body).exclude_sensors()
+    }
+}
+
+fn vector(v: Vec3) -> rp::Vector {
+    rp::Vector::from_array(v.to_array())
 }
 
 /// The part's position and rotation.
@@ -194,7 +288,7 @@ mod tests {
     fn settle(seconds: f32) -> HashMap<String, Vec3> {
         let dom = kahua_io::read_file(std::path::Path::new("examples/physics.rbxl")).unwrap();
         let mut scene = Scene::extract(&dom);
-        let mut physics = Physics::new(&dom, &scene);
+        let mut physics = Physics::new(&dom, &scene, None);
         for _ in 0..(seconds * 60.0) as usize {
             physics.update(1.0 / 60.0, &mut scene);
         }
@@ -204,7 +298,10 @@ mod tests {
     #[test]
     fn demo_place_settles() {
         let at = settle(4.0);
-        let loose = ["Block0", "Block9", "Ball0", "Barrel", "Handle", "Head", "Floater"];
+        let loose = [
+            "Block0", "Block1", "Block2", "Block3", "Block4", "Block5", "Block6", "Block7", "Block8", "Block9",
+            "Ball0", "Barrel", "Handle", "Head", "Floater",
+        ];
         for name in loose {
             eprintln!("{name}: {:.2}", at[name]);
         }

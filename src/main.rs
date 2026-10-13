@@ -2,8 +2,11 @@
 
 mod app;
 mod blit;
-mod fly;
+mod camera;
+mod character;
+mod input;
 mod physics;
+mod rig;
 
 use std::path::PathBuf;
 

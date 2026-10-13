@@ -97,6 +97,13 @@ fn main() -> anyhow::Result<()> {
         part("Floater", "Part", Vec3::new(-10.0, 20.0, 12.0), Vec3::new(3.0, 3.0, 3.0), (1.0, 0.85, 0.1), false),
     );
 
+    // Move the template's spawn out from under the tower.
+    let spawn = dom.descendants_of(ws).find(|i| i.class == "SpawnLocation").unwrap().referent();
+    dom.get_by_ref_mut(spawn)
+        .unwrap()
+        .properties
+        .insert("CFrame".into(), cframe_from_pos_rot(Vec3::new(0.0, 0.5, -30.0), Quat::IDENTITY).into());
+
     kahua_io::write_file(&dom, std::path::Path::new(&out))?;
     println!("wrote {out}");
     Ok(())

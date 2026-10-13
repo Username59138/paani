@@ -18,16 +18,17 @@ cargo run --release -- examples/physics.rbxl   # things that fall
 
 | Input | Action |
 |---|---|
-| Right mouse (hold) | Look around |
-| W A S D | Move |
-| Q / E | Down / up |
-| Shift | Move faster |
-| Esc | Release the mouse |
+| W A S D | Walk |
+| Space | Jump |
+| Right mouse (hold) | Turn the camera |
+| Scroll | Zoom |
+| F | Free camera (WASD, Q/E down/up, Shift faster) |
 | R | Restart the physics |
+| Esc | Release the mouse |
 
 ## Roadmap
 
-1. **Engine** (offline): render places ✅, physics ✅, character, Luau scripts
+1. **Engine** (offline): render places ✅, physics ✅, character ✅, Luau scripts
 2. **Client**: home screen, settings, graphics presets, profiles, stats
 3. **Online**: join Roblox servers, server browser
 
