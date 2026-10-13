@@ -15,6 +15,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::blit::Blit;
 use crate::fly::FlyCamera;
+use crate::physics::Physics;
 
 struct Gpu {
     window: Arc<Window>,
@@ -66,6 +67,10 @@ impl Gpu {
         Ok(Self { window, surface, config, device, queue, renderer, blit })
     }
 
+    fn set_scene(&mut self, scene: &Scene) {
+        self.renderer.set_scene(&self.device, &self.queue, scene);
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
@@ -105,7 +110,11 @@ impl Gpu {
 
 pub struct App {
     title: String,
+    dom: WeakDom,
+    /// The scene as loaded, for restarting the simulation.
+    initial_scene: Scene,
     scene: Scene,
+    physics: Physics,
     fly: FlyCamera,
     gpu: Option<Gpu>,
     error: Option<anyhow::Error>,
@@ -114,13 +123,34 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dom: &WeakDom, title: String) -> Self {
-        let scene = Scene::extract(dom);
+    pub fn new(dom: WeakDom, title: String) -> Self {
+        let scene = Scene::extract(&dom);
         for warning in &scene.warnings {
             eprintln!("warning: {warning}");
         }
+        let physics = Physics::new(&dom, &scene);
         let fly = FlyCamera::new(default_camera(&scene));
-        Self { title, scene, fly, gpu: None, error: None, last_frame: Instant::now(), fps_window: (Instant::now(), 0) }
+        Self {
+            title,
+            dom,
+            initial_scene: scene.clone(),
+            scene,
+            physics,
+            fly,
+            gpu: None,
+            error: None,
+            last_frame: Instant::now(),
+            fps_window: (Instant::now(), 0),
+        }
+    }
+
+    /// Puts every part back where it was loaded and starts the simulation over.
+    fn restart(&mut self) {
+        self.scene = self.initial_scene.clone();
+        self.physics = Physics::new(&self.dom, &self.scene);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_scene(&self.scene);
+        }
     }
 
     /// Returns the error that stopped the event loop, if any.
@@ -140,8 +170,12 @@ impl App {
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         self.fly.update(dt);
+        let moved = self.physics.update(dt, &mut self.scene);
 
         let Some(gpu) = &mut self.gpu else { return };
+        if moved {
+            gpu.set_scene(&self.scene);
+        }
         gpu.draw(&self.fly.camera);
 
         let (start, frames) = &mut self.fps_window;
@@ -188,6 +222,9 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if code == KeyCode::Escape {
                         self.set_looking(false);
+                    }
+                    if code == KeyCode::KeyR && event.state.is_pressed() && !event.repeat {
+                        self.restart();
                     }
                     self.fly.key(code, event.state.is_pressed());
                 }

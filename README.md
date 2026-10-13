@@ -11,6 +11,7 @@ An open-source client for Roblox places, written in Rust. Companion to
 git clone https://github.com/Username59138/paani
 cd paani
 cargo run --release -- examples/demo.rbxl
+cargo run --release -- examples/physics.rbxl   # things that fall
 ```
 
 ## Controls
@@ -22,10 +23,11 @@ cargo run --release -- examples/demo.rbxl
 | Q / E | Down / up |
 | Shift | Move faster |
 | Esc | Release the mouse |
+| R | Restart the physics |
 
 ## Roadmap
 
-1. **Engine** (offline): render places ✅, physics, character, Luau scripts
+1. **Engine** (offline): render places ✅, physics ✅, character, Luau scripts
 2. **Client**: home screen, settings, graphics presets, profiles, stats
 3. **Online**: join Roblox servers, server browser
 

@@ -3,6 +3,7 @@
 mod app;
 mod blit;
 mod fly;
+mod physics;
 
 use std::path::PathBuf;
 
@@ -15,7 +16,7 @@ fn main() -> Result<()> {
     let name = path.file_stem().unwrap_or_default().to_string_lossy();
 
     let event_loop = EventLoop::new()?;
-    let mut app = app::App::new(&dom, format!("{name} - Paani"));
+    let mut app = app::App::new(dom, format!("{name} - Paani"));
     event_loop.run_app(&mut app)?;
     app.finish()
 }
